@@ -6,7 +6,7 @@ on:
     - cron: '0 1 * * *'
 
 jobs:
-  run_technoheberg_earn:
+  run_techno_coins:
     runs-on: ubuntu-latest
     steps:
 
