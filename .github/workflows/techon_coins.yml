@@ -1,0 +1,690 @@
+import os
+import time
+import json
+import subprocess
+import urllib.request
+import urllib.parse
+from seleniumbase import SB
+
+# ============================================================
+# 配置
+# ============================================================
+
+DISCORD_TOKEN = os.environ["TECHNO_ACCOUNT"].strip()
+LOCAL_PROXY   = "http://127.0.0.1:8080"
+
+DISCORD_OAUTH_URL = (
+    "https://discord.com/oauth2/authorize"
+    "?response_type=code"
+    "&redirect_uri=https%3A%2F%2Fdash.technoheberg.com%2Fauth%2Fdiscord%2Fcallback"
+    "&scope=identify%20email%20guilds.join"
+    "&client_id=1308458819558314024"
+)
+
+EARN_URL = "https://dash.technoheberg.com/earn"
+
+_tg = os.environ.get("TG_BOT", "").split(",")
+TG_CHAT_ID = _tg[0].strip() if len(_tg) >= 2 else ""
+TG_TOKEN   = _tg[1].strip() if len(_tg) >= 2 else ""
+
+
+# ============================================================
+# 工具函数
+# ============================================================
+
+def now_str():
+    import datetime
+    return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def send_tg(msg_text: str):
+    if not TG_CHAT_ID or not TG_TOKEN:
+        return
+    full = (
+        f"💰 TechnoHeberg 积分领取通知\n"
+        f"🕐 运行时间: {now_str()}\n"
+        f"{msg_text}"
+    )
+    url  = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": TG_CHAT_ID, "text": full}).encode()
+    try:
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=15):
+            print("📨 TG推送成功")
+    except Exception as e:
+        print(f"⚠️ TG推送失败：{e}")
+
+
+# ============================================================
+# xdotool 点击
+# ============================================================
+
+def xdotool_click(x, y):
+    x, y = int(x), int(y)
+    try:
+        result = subprocess.run(
+            ["xdotool", "search", "--onlyvisible", "--class", "chrome"],
+            capture_output=True, text=True, timeout=3
+        )
+        wids = [w for w in result.stdout.strip().split('\n') if w]
+        if wids:
+            subprocess.run(["xdotool", "windowactivate", wids[-1]],
+                           timeout=2, stderr=subprocess.DEVNULL)
+            time.sleep(0.2)
+        subprocess.run(["xdotool", "mousemove", str(x), str(y)], timeout=2, check=True)
+        time.sleep(0.15)
+        subprocess.run(["xdotool", "click", "1"], timeout=2, check=True)
+        print("📐 坐标点击成功")
+        return True
+    except Exception as e:
+        print(f"⚠️ xdotool点击失败：{e}")
+        return False
+
+
+def get_window_offset(sb):
+    try:
+        result = subprocess.run(
+            ["xdotool", "search", "--onlyvisible", "--class", "chrome"],
+            capture_output=True, text=True, timeout=3
+        )
+        wids = [w for w in result.stdout.strip().split('\n') if w]
+        if wids:
+            geo = subprocess.run(
+                ["xdotool", "getwindowgeometry", "--shell", wids[-1]],
+                capture_output=True, text=True, timeout=3
+            ).stdout
+            geo_dict = {}
+            for line in geo.strip().split('\n'):
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    geo_dict[k.strip()] = int(v.strip())
+            win_x = geo_dict.get('X', 0)
+            win_y = geo_dict.get('Y', 0)
+            info = sb.execute_script(
+                "(function(){ return { outer: window.outerHeight, inner: window.innerHeight }; })()"
+            )
+            toolbar = info['outer'] - info['inner']
+            if not (30 <= toolbar <= 200):
+                toolbar = 87
+            return win_x, win_y, toolbar
+    except Exception:
+        pass
+    try:
+        info = sb.execute_script("""
+            (function(){
+                return {
+                    screenX: window.screenX || 0,
+                    screenY: window.screenY || 0,
+                    outer: window.outerHeight,
+                    inner: window.innerHeight
+                };
+            })()
+        """)
+        toolbar = info['outer'] - info['inner']
+        if not (30 <= toolbar <= 200):
+            toolbar = 87
+        return info['screenX'], info['screenY'], toolbar
+    except Exception:
+        return 0, 0, 87
+
+
+# ============================================================
+# Turnstile 模块
+# ============================================================
+
+EXPAND_POPUP_JS = """
+(function() {
+    var turnstileInput = document.querySelector('input[name="cf-turnstile-response"]');
+    if (!turnstileInput) return;
+    var el = turnstileInput;
+    for (var i = 0; i < 20; i++) {
+        el = el.parentElement;
+        if (!el) break;
+        var style = window.getComputedStyle(el);
+        if (style.overflow === 'hidden' || style.overflowX === 'hidden' || style.overflowY === 'hidden') {
+            el.style.overflow = 'visible';
+        }
+        el.style.minWidth = 'max-content';
+    }
+})();
+"""
+
+INJECT_TOKEN_LISTENER_JS = """
+(function() {
+    if (window.__cf_token_listener_injected__) return;
+    window.__cf_token_listener_injected__ = true;
+    window.__cf_turnstile_token__ = '';
+
+    window.addEventListener('message', function(e) {
+        try {
+            var d = e.data;
+            if (!d || typeof d !== 'object') return;
+            if (d.event === 'food') return;
+            var token = d.token || d.response;
+            if (token && token.length > 20) {
+                window.__cf_turnstile_token__ = token;
+                var inputs = document.querySelectorAll(
+                    'input[name="cf-turnstile-response"], input[name="cf_turnstile_response"]'
+                );
+                for (var i = 0; i < inputs.length; i++) {
+                    try {
+                        var nativeSet = Object.getOwnPropertyDescriptor(
+                            HTMLInputElement.prototype, 'value'
+                        ).set;
+                        nativeSet.call(inputs[i], token);
+                        inputs[i].dispatchEvent(new Event('input',  {bubbles: true}));
+                        inputs[i].dispatchEvent(new Event('change', {bubbles: true}));
+                    } catch(err) {
+                        inputs[i].value = token;
+                    }
+                }
+            }
+        } catch(err) {}
+    });
+})();
+"""
+
+READ_CAPTURED_TOKEN_JS = """
+(function(){
+    return window.__cf_turnstile_token__ || '';
+})()
+"""
+
+
+def turnstile_exists(sb) -> bool:
+    try:
+        return sb.execute_script(
+            "(function(){ return document.querySelector('input[name=\"cf-turnstile-response\"]') !== null; })()"
+        )
+    except Exception:
+        return False
+
+
+def check_turnstile_token(sb) -> bool:
+    try:
+        input_ok = sb.execute_script("""
+            (function(){
+                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                return input && input.value && input.value.length > 20;
+            })()
+        """)
+        if input_ok:
+            return True
+    except Exception:
+        pass
+    try:
+        token = sb.execute_script(READ_CAPTURED_TOKEN_JS)
+        if token and len(token) > 20:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def get_turnstile_token_value(sb) -> str:
+    try:
+        token = sb.execute_script(READ_CAPTURED_TOKEN_JS)
+        if token and len(token) > 20:
+            return token
+    except Exception:
+        pass
+    try:
+        token = sb.execute_script("""
+            (function(){
+                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                return (input && input.value) ? input.value : '';
+            })()
+        """)
+        if token and len(token) > 20:
+            return token
+    except Exception:
+        pass
+    return ''
+
+
+def get_turnstile_coords(sb):
+    try:
+        return sb.execute_script("""
+            (function(){
+                var container = document.querySelector('.cf-turnstile, #turnstileContainer iframe, [id*="turnstile"] iframe');
+                if (!container) {
+                    container = document.querySelector('input[name="cf-turnstile-response"]');
+                    if (container) container = container.parentElement;
+                }
+                if (!container) return null;
+                var rect = container.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return null;
+                return {
+                    click_x: Math.round(rect.left + 22),
+                    click_y: Math.round(rect.top + rect.height / 2)
+                };
+            })()
+        """)
+    except Exception:
+        return None
+
+
+def inject_token_listener(sb):
+    try:
+        sb.execute_script(INJECT_TOKEN_LISTENER_JS)
+        print("📡 开始监控Cloudflare Turnstile Token...")
+    except Exception as e:
+        print(f"⚠️ 监听器注入失败：{e}")
+
+
+def solve_turnstile(sb) -> bool:
+    for _ in range(3):
+        sb.execute_script(EXPAND_POPUP_JS)
+        time.sleep(0.5)
+
+    inject_token_listener(sb)
+
+    if check_turnstile_token(sb):
+        print("✅ 验证已自动通过")
+        return True
+
+    sb.execute_script("""
+        var c = document.querySelector('.cf-turnstile, #turnstileContainer');
+        if (c) c.scrollIntoView({behavior:'smooth', block:'center'});
+    """)
+    time.sleep(1.5)
+
+    coords = get_turnstile_coords(sb)
+    if not coords:
+        print("❌ 验证坐标获取失败")
+        sb.save_screenshot("turnstile_no_coords.png")
+        return False
+
+    win_x, win_y, toolbar = get_window_offset(sb)
+    abs_x = coords['click_x'] + win_x
+    abs_y = coords['click_y'] + win_y + toolbar
+    print("📐 坐标计算完成")
+    xdotool_click(abs_x, abs_y)
+
+    for _ in range(30):
+        time.sleep(0.5)
+        if check_turnstile_token(sb):
+            token = get_turnstile_token_value(sb)
+            print(f"✅ Cloudflare Turnstile 验证通过！token：{token[:50]}...")
+            return True
+
+    print("❌ 人机验证超时")
+    sb.save_screenshot("turnstile_fail.png")
+    return False
+
+
+# ============================================================
+# Discord Token 登录
+# ============================================================
+
+BLOCK_WINDOW_OPEN_JS = """
+(function() {
+    if (window.__window_open_blocked__) return;
+    window.__window_open_blocked__ = true;
+    window.open = function() {
+        console.log('[BLOCK] window.open 已被拦截');
+        return null;
+    };
+    console.log('[BLOCK] window.open 拦截器已注入');
+})();
+"""
+
+def discord_login(sb) -> bool:
+    """通过 Discord OAuth 页面注入 Token 完成登录，返回是否成功"""
+    print("🔑 打开 Discord OAuth 授权页面...")
+    sb.uc_open_with_reconnect(DISCORD_OAUTH_URL, reconnect_time=4)
+    time.sleep(3)
+
+    # 注入 Discord Token 到 localStorage，模拟已登录状态
+    print("💉 注入 Discord Token...")
+    try:
+        sb.execute_script(f"""
+            (function() {{
+                var token = '{DISCORD_TOKEN}';
+                // Discord 将 token 存在 localStorage
+                localStorage.setItem('token', JSON.stringify(token));
+            }})();
+        """)
+        # 刷新页面让 Discord 读取 localStorage 中的 token
+        sb.execute_script("location.reload();")
+        time.sleep(4)
+    except Exception as e:
+        print(f"⚠️ Token注入失败：{e}")
+
+    # 等待授权页面出现 Authorize 按钮
+    print("⏳ 等待授权页面加载...")
+    authorize_visible = False
+    for _ in range(20):
+        try:
+            cur = sb.get_current_url()
+            # 检查是否已登录并出现授权按钮
+            has_btn = sb.execute_script("""
+                (function(){
+                    var btn = document.querySelector('button[type="submit"]');
+                    if (!btn) return false;
+                    return btn.textContent.trim().toLowerCase().includes('authorize') ||
+                           btn.textContent.trim().toLowerCase().includes('autoriser');
+                })()
+            """)
+            if has_btn:
+                authorize_visible = True
+                print("✅ 授权按钮已出现")
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+
+    if not authorize_visible:
+        print("❌ 授权按钮未出现，可能 Token 无效或页面异常")
+        sb.save_screenshot("discord_auth_fail.png")
+        return False
+
+    # 点击 Authorize 按钮
+    print("🖱️ 点击 Authorize 按钮...")
+    try:
+        sb.execute_script("""
+            (function(){
+                var btns = document.querySelectorAll('button[type="submit"]');
+                for (var i = 0; i < btns.length; i++) {
+                    var t = btns[i].textContent.trim().toLowerCase();
+                    if (t.includes('authorize') || t.includes('autoriser')) {
+                        btns[i].click();
+                        return;
+                    }
+                }
+            })();
+        """)
+    except Exception as e:
+        print(f"⚠️ 点击授权按钮失败：{e}")
+        sb.save_screenshot("discord_click_fail.png")
+        return False
+
+    # 等待跳转到 dash.technoheberg.com
+    print("⏳ 等待跳转到 TechnoHeberg...")
+    for _ in range(30):
+        time.sleep(1)
+        try:
+            cur = sb.get_current_url()
+            if "dash.technoheberg.com" in cur:
+                print(f"✅ Discord 登录成功，已跳转到：{cur}")
+                return True
+        except Exception:
+            pass
+
+    print("❌ 登录跳转超时")
+    sb.save_screenshot("discord_redirect_fail.png")
+    return False
+
+
+# ============================================================
+# 获取 Link ID 列表
+# ============================================================
+
+def get_link_ids(sb) -> list:
+    try:
+        ids = sb.execute_script("""
+            (function(){
+                var cards = document.querySelectorAll('[data-link-id]');
+                var result = [];
+                for (var i = 0; i < cards.length; i++) {
+                    var id = cards[i].getAttribute('data-link-id');
+                    if (id) result.push(id);
+                }
+                // 去重，保留顺序
+                return result.filter(function(v, i, a){ return a.indexOf(v) === i; });
+            })()
+        """)
+        return ids or []
+    except Exception as e:
+        print(f"⚠️ 获取 link ID 失败：{e}")
+        return []
+
+
+# ============================================================
+# 单个 Link 领取流程
+# ============================================================
+
+def earn_single_link(sb, link_id: str, index: int) -> bool:
+    """完成一个 link 的领取，返回是否成功"""
+    print(f"  🔗 [{index}] linkId: {link_id}")
+
+    # ── 1. POST /earn/start ──────────────────────────────────
+    print(f"  📤 [{index}] 发送 /earn/start 请求...")
+    start_result = sb.execute_script(f"""
+        return (async function() {{
+            try {{
+                var resp = await fetch('/earn/start', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{linkId: '{link_id}'}})
+                }});
+                var data = await resp.json();
+                return {{ok: resp.ok, status: resp.status, data: data}};
+            }} catch(e) {{
+                return {{ok: false, error: e.toString()}};
+            }}
+        }})();
+    """)
+
+    if not start_result or not start_result.get('ok'):
+        print(f"  ❌ [{index}] /earn/start 失败：{start_result}")
+        return False
+
+    data = start_result.get('data', {})
+    if not data.get('success'):
+        print(f"  ⚠️ [{index}] /earn/start 返回 success=false：{data}")
+        return False
+
+    task_token   = data.get('token', '')
+    timestamp    = data.get('timestamp', 0)
+    min_wait     = data.get('minWaitTime', 10)
+    print(f"  ✅ [{index}] /earn/start 成功，等待时间：{min_wait}s")
+
+    # ── 2. 等待倒计时 ────────────────────────────────────────
+    print(f"  ⏳ [{index}] 等待倒计时 {min_wait} 秒...")
+    time.sleep(min_wait + 1)  # 多等 1 秒确保服务端计时完成
+
+    # ── 3. 等待 Turnstile 出现并解决 ─────────────────────────
+    print(f"  🔐 [{index}] 等待 Turnstile 验证组件...")
+
+    # 先注入监听器
+    inject_token_listener(sb)
+
+    # 等待 turnstileContainer 显示
+    turnstile_ready = False
+    for _ in range(20):
+        try:
+            visible = sb.execute_script("""
+                (function(){
+                    var el = document.getElementById('turnstileContainer');
+                    if (!el) return false;
+                    var style = window.getComputedStyle(el);
+                    return style.display !== 'none' && style.visibility !== 'hidden';
+                })()
+            """)
+            if visible:
+                turnstile_ready = True
+                print(f"  ✅ [{index}] Turnstile 组件已显示")
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    if not turnstile_ready:
+        print(f"  ⚠️ [{index}] Turnstile 未出现，尝试直接检测...")
+
+    if not solve_turnstile(sb):
+        print(f"  ❌ [{index}] Turnstile 验证失败")
+        sb.save_screenshot(f"earn_turnstile_fail_{index}.png")
+        return False
+
+    turnstile_token = get_turnstile_token_value(sb)
+    if not turnstile_token:
+        print(f"  ❌ [{index}] 无法获取 turnstile token")
+        return False
+
+    # ── 4. POST /earn/challenge ──────────────────────────────
+    print(f"  📤 [{index}] 发送 /earn/challenge 请求...")
+    challenge_result = sb.execute_script(f"""
+        return (async function() {{
+            try {{
+                var resp = await fetch('/earn/challenge', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{
+                        token: '{task_token}',
+                        timestamp: {timestamp}
+                    }})
+                }});
+                var data = await resp.json();
+                return {{ok: resp.ok, status: resp.status, data: data}};
+            }} catch(e) {{
+                return {{ok: false, error: e.toString()}};
+            }}
+        }})();
+    """)
+    print(f"  ✅ [{index}] /earn/challenge 响应：{challenge_result}")
+
+    # ── 5. POST /earn/verify ─────────────────────────────────
+    print(f"  📤 [{index}] 发送 /earn/verify 请求...")
+    verify_result = sb.execute_script(f"""
+        return (async function() {{
+            try {{
+                var resp = await fetch('/earn/verify', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{
+                        token: '{task_token}',
+                        timestamp: {timestamp},
+                        turnstileToken: '{turnstile_token}'
+                    }})
+                }});
+                var data = await resp.json();
+                return {{ok: resp.ok, status: resp.status, data: data}};
+            }} catch(e) {{
+                return {{ok: false, error: e.toString()}};
+            }}
+        }})();
+    """)
+
+    if not verify_result or not verify_result.get('ok'):
+        print(f"  ❌ [{index}] /earn/verify 失败：{verify_result}")
+        return False
+
+    verify_data = verify_result.get('data', {})
+    print(f"  ✅ [{index}] /earn/verify 成功：{verify_data}")
+
+    # ── 6. 重置 Turnstile 状态，准备下一个 ──────────────────
+    try:
+        sb.execute_script("""
+            (function(){
+                window.__cf_turnstile_token__ = '';
+                window.__cf_token_listener_injected__ = false;
+                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                if (input) input.value = '';
+            })()
+        """)
+    except Exception:
+        pass
+
+    return True
+
+
+# ============================================================
+# 主流程
+# ============================================================
+
+def run_script():
+    print("🔧 启动浏览器...")
+
+    with SB(uc=True, test=True, proxy=LOCAL_PROXY) as sb:
+        print("🚀 浏览器就绪！")
+
+        # ── IP 验证 ──────────────────────────────────────────
+        print("🌐 验证出口IP...")
+        try:
+            sb.open("https://api.ipify.org/?format=json")
+            import re as _re
+            ip_text = sb.get_text('body')
+            ip_text = _re.sub(r'(\d+\.\d+\.\d+\.)\d+', r'\1xx', ip_text)
+            print(f"✅ 出口IP确认：{ip_text}")
+        except Exception:
+            print("⚠️ IP验证超时，跳过")
+
+        # ── Discord 登录 ──────────────────────────────────────
+        if not discord_login(sb):
+            send_tg("❌ Discord 登录失败")
+            return
+
+        # ── 跳转到 Earn 页面 ──────────────────────────────────
+        print("🔍 跳转到 Earn Credits 页面...")
+        sb.execute_script(f"window.location.href = '{EARN_URL}';")
+        time.sleep(4)
+
+        if "auth" in sb.get_current_url() or "login" in sb.get_current_url():
+            print("❌ 被踢回登录页，Session 无效")
+            sb.save_screenshot("earn_page_fail.png")
+            send_tg("❌ 跳转 Earn 页面后被踢回登录页")
+            return
+
+        sb.save_screenshot("earn_page.png")
+
+        # ── 注入 window.open 拦截器 ───────────────────────────
+        print("🚫 注入 window.open 拦截器...")
+        sb.execute_script(BLOCK_WINDOW_OPEN_JS)
+
+        # ── 获取所有 Link ID ──────────────────────────────────
+        print("🔍 获取 Link 列表...")
+        link_ids = get_link_ids(sb)
+        if not link_ids:
+            print("❌ 未找到任何 Link")
+            sb.save_screenshot("no_links.png")
+            send_tg("❌ 未找到任何 Link")
+            return
+
+        print(f"✅ 共找到 {len(link_ids)} 个 Link：{link_ids}")
+
+        # ── 逐个领取 ─────────────────────────────────────────
+        success_count = 0
+        fail_count    = 0
+
+        for i, link_id in enumerate(link_ids, start=1):
+            print(f"\n{'='*50}")
+            print(f"🎯 开始处理 Link {i}/{len(link_ids)}")
+
+            # 每次处理前重新注入拦截器（页面可能有动态刷新）
+            sb.execute_script(BLOCK_WINDOW_OPEN_JS)
+
+            try:
+                ok = earn_single_link(sb, link_id, i)
+            except Exception as e:
+                print(f"  ❌ [{i}] 异常：{e}")
+                sb.save_screenshot(f"earn_error_{i}.png")
+                ok = False
+
+            if ok:
+                success_count += 1
+                print(f"  🎉 [{i}] Link {i} 领取成功！")
+            else:
+                fail_count += 1
+                print(f"  ❌ [{i}] Link {i} 领取失败")
+
+            # 每个 link 之间稍作间隔
+            if i < len(link_ids):
+                print(f"  ⏸️ 等待 3 秒后处理下一个...")
+                time.sleep(3)
+
+        # ── 汇总 ─────────────────────────────────────────────
+        print(f"\n{'='*50}")
+        print(f"📊 领取完毕：成功 {success_count} / 失败 {fail_count} / 共 {len(link_ids)}")
+        sb.save_screenshot("earn_done.png")
+        send_tg(
+            f"📊 积分领取完毕\n"
+            f"✅ 成功：{success_count} 个\n"
+            f"❌ 失败：{fail_count} 个\n"
+            f"📦 共计：{len(link_ids)} 个"
+        )
+
+
+if __name__ == "__main__":
+    run_script()
