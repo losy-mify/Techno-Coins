@@ -1,9 +1,9 @@
-name: TechnoHeberg-Earn
+name: TechnoHeberg-Coins
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '0 1 * * *'
 
 jobs:
   run_technoheberg_earn:
